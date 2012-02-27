@@ -1,3 +1,6 @@
+/*! gimp iff/pbm file reader plugin
+\author Adam Hlavatovič
+\version 20120227 */
 #include <fstream>
 using std::ifstream;
 #include <stdexcept>
@@ -11,11 +14,13 @@ using std::map;
 #include <cstring>
 #include <libgimp/gimp.h>
 
-#include <iostream>
-using std::cout;
-#include <iomanip>
-using std::hex;
-using std::dec;
+#ifdef DEBUG
+	#include <iostream>
+	using std::cout;
+	#include <iomanip>
+	using std::hex;
+	using std::dec;
+#endif
 
 
 #define LOAD_PROC "file-pbm-load"
@@ -90,12 +95,24 @@ logic_error unknown_image_format(uint8_t * buf, int n)
 	return logic_error(o.str());
 }
 
+logic_error chunk_size_field_corrupted(char * magic, uint32_t size)
+{
+	ostringstream o;
+	o << "chunk size field corrupted, " << magic << ".size:" << size;
+	return logic_error(o.str());	
+}
+
 string error_string;
 
-
-// Compressions
+// compressions
 #define cmpNone 0
 #define cmpByteRun1 1
+
+// masking
+#define mskNone 0
+#define mskHasMask 1
+#define mskHasTransparentColor 2
+#define mskLasso 3
 
 
 chunk_header read_chunk_header(ifstream & fin, uint32_t offset);
@@ -109,7 +126,6 @@ uint8_t * process_body(ifstream & fin, chunk_info const & info,
 void list_chunks(ifstream & fin, uint32_t form_size, 
 	map<string, chunk_info> & chunks);
 
-//! Dekóder byteRun kódovania použitého v IFF.ILBM a IFF.PBM súboroch.
 bool unpack_byte_run_1(uint8_t * first, uint8_t * last, uint8_t * result, 
 	uint32_t result_size);
 
@@ -164,10 +180,17 @@ void pbm_image::load(string const & filename) throw(logic_error)
 		throw logic_error("bitmap header missing");
 	_header = process_bmhd(fin, it->second);
 
-	// not all features are not supported
+	// not all features are now supported
+#ifdef DEBUG	
 	cout << "planes:" << int(_header.nplanes) << "\n";
+	cout << "masking:" << int(_header.masking) << "\n";
+#endif
+
 	if (_header.nplanes != 8)
 		throw logic_error("only 8bit planes images are supported");
+
+	if (_header.masking != mskNone)
+		throw logic_error("masked images are not yet supported");
 
 	// CMAP
 	it = chunks.find("CMAP");
@@ -190,8 +213,10 @@ void list_chunks(ifstream & fin, uint32_t form_size,
 	uint32_t offset = fin.tellg();
 	uint32_t end_offset = offset + form_size - 4;
 	
+#ifdef DEBUG	
 	cout << hex << "offset:" << offset << "\n"
 		<< "end_offset:" << end_offset << dec << "\n";
+#endif	
 
 	while (fin && (offset < end_offset))
 	{
@@ -199,11 +224,7 @@ void list_chunks(ifstream & fin, uint32_t form_size,
 		info.offset = offset + 8;
 
 		chunk_header head = read_chunk_header(fin, offset);
-		info.size = head.size;
 
-		if (head.size > form_size)
-			cout << "fatal error: size field corrupted\n";
-		
 		char magic[5];
 		char * t = magic;
 		char * s = head.magic;
@@ -211,14 +232,20 @@ void list_chunks(ifstream & fin, uint32_t form_size,
 			*t++ = *s++;
 		*t = '\0';
 
+		info.size = head.size;
+		if (head.size > form_size)
+			throw chunk_size_field_corrupted(magic, head.size);
+		
 		chunks.insert(make_pair(string(magic), info));
-
-		cout << "chunk {magic:'" << magic 
-			<< hex << "', offset:" << info.offset
-			<< dec << ", size:" << info.size << "} append\n";
 
 		int padding = info.size % 2;
 		offset = info.offset + info.size + padding;
+
+#ifdef DEBUG
+		cout << "chunk {magic:'" << magic 
+			<< hex << "', offset:" << info.offset
+			<< dec << ", size:" << info.size << "} append\n";
+#endif
 	}
 }
 
@@ -261,7 +288,7 @@ void query()
 		"help",
 		"Adam Hlavatovic",
 		"copyleft",
-		"date",
+		"2012",
 		"menu label",
 		NULL,
 		GIMP_PLUGIN,
