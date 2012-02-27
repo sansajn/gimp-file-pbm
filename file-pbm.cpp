@@ -1,13 +1,30 @@
-/* Číta súbory iff/pbm pouzité v settlers 2. */
-#include <iostream>
-using std::cout;
 #include <fstream>
 using std::ifstream;
+#include <stdexcept>
+using std::logic_error;
+#include <string>
+using std::string;
+#include <sstream>
+using std::ostringstream;
+#include <map>
+using std::map;
 #include <cstring>
 #include <libgimp/gimp.h>
 
 #define LOAD_PROC "file-pbm-load"
 
+
+struct chunk_info 
+{
+	uint32_t size;
+	uint32_t offset;
+};
+
+struct chunk_header 
+{
+	char magic[4];
+	uint32_t size;
+};
 
 struct bitmap_header
 {
@@ -26,15 +43,68 @@ struct bitmap_header
 	int16_t page_height;
 };
 
+struct color_map
+{
+	uint8_t * colors;
+	size_t ncolors;
 
-void query();
-void run(gchar const * name, gint nparams, GimpParam const * param,
-	gint * nreturn_vals, GimpParam ** return_vals);
+	color_map() {}
+	color_map(uint8_t * c, size_t n) : colors(c), ncolors(n) {}
+};
 
-/*! Dekóder byteRun kódovania použitého v IFF.ILBM a IFF.PBM súboroch. */
+class pbm_image
+{
+public:
+	void load(string const & filename) throw(logic_error);
+	size_t w() const {return _header.w;}
+	size_t h() const {return _header.h;}
+	bool has_colormap() const {return _cmap.colors;}
+	color_map const & colormap() const {return _cmap;}
+	uint8_t const * data() const {return _body;}
+
+private:
+	color_map _cmap;
+	uint8_t * _body;
+	bitmap_header _header;
+};
+
+logic_error cant_open_file(string const & filename)
+{
+	ostringstream o;
+	o << "could not open '" << filename << "' file";
+	return logic_error(o.str());
+}
+
+logic_error unknown_image_format(uint8_t * buf, int n)
+{
+	ostringstream o;
+	o << "unknown image format (magic='" 
+		<< string((char *)buf, (char *)buf+n) << "')";
+	return logic_error(o.str());
+}
+
+string error_string;
+
+
+// Compressions
+#define cmpNone 0
+#define cmpByteRun1 1
+
+
+chunk_header read_chunk_header(ifstream & fin, uint32_t offset);
+gint32 gimp_image(string const & filename);
+gint32 create_gimp_image(string const & name, pbm_image const & pbm);
+bitmap_header process_bmhd(ifstream & fin, chunk_info const & info);
+color_map process_cmap(ifstream & fin, chunk_info const & info,
+	bitmap_header const & head);
+uint8_t * process_body(ifstream & fin, chunk_info const & info, 
+	bitmap_header const & head);
+void list_chunks(ifstream & fin, uint32_t form_size, 
+	map<string, chunk_info> & chunks);
+
+//! Dekóder byteRun kódovania použitého v IFF.ILBM a IFF.PBM súboroch.
 bool unpack_byte_run_1(uint8_t * first, uint8_t * last, uint8_t * result, 
 	uint32_t result_size);
-
 
 //! Big to little endian conversion.
 //@{
@@ -59,6 +129,94 @@ void tole4(T & value, Args & ... args)
 }
 //@}
 
+void pbm_image::load(string const & filename) throw(logic_error)
+{
+	ifstream fin(filename);
+	if (!fin.is_open())
+		throw cant_open_file(filename);
+
+	uint8_t buf[0x0b];
+	fin.read((char *)buf, 0x0b);
+	
+	if (strncmp((char const *)buf, "FORM", 4))
+		throw logic_error("not an ea85 iff container");
+	
+	if (strncmp((char const *)buf+8, "PBM", 3))
+		throw unknown_image_format(buf, 3);
+
+	uint32_t form_size;
+	memcpy((void *)&form_size, (void *)(buf+4), 4);
+	tole4(form_size);
+
+	map<string, chunk_info> chunks;
+	list_chunks(fin, form_size, chunks);
+
+	// BMHD
+	auto it = chunks.find("BMHD");
+	if (it == chunks.end())
+		throw logic_error("bitmap header missing");
+	_header = process_bmhd(fin, it->second);
+
+	// not all features are not supported
+	if (_header.nplanes != 8)
+		throw logic_error("only 8bit planes images are supported");
+
+	// CMAP
+	it = chunks.find("CMAP");
+	if (it != chunks.end())
+		_cmap = process_cmap(fin, it->second, _header);		
+
+	// BODY
+	it = chunks.find("BODY");
+	if (it != chunks.end())
+	{
+		_body = process_body(fin, it->second, _header);
+		if (!_body)
+			throw logic_error("image data corrupded, can't unpack");
+	}
+}
+
+void list_chunks(ifstream & fin, uint32_t form_size, 
+	map<string, chunk_info> & chunks)
+{
+	uint32_t offset = fin.tellg();
+	uint32_t end_offset = offset + form_size;
+
+	while (fin && offset < end_offset)
+	{
+		chunk_info info;
+		info.offset = offset;
+
+		chunk_header header = read_chunk_header(fin, offset);
+		info.size = header.size;
+		
+		char magic[5];
+		char * t = magic;
+		char * s = header.magic;
+		while (!isspace(*s))
+			*t++ = *s;
+		*t = '\0';
+
+		chunks.insert(make_pair(string(magic), info));
+
+		offset += header.size;
+	}
+}
+
+chunk_header read_chunk_header(ifstream & fin, uint32_t offset)
+{
+	fin.seekg(offset);
+	chunk_header head;
+	fin.read((char *)&head, sizeof(chunk_header));
+	tole4(head.size);
+	return head;
+}
+
+
+void query();
+void run(gchar const * name, gint nparams, GimpParam const * param,
+	gint * nreturn_vals, GimpParam ** return_vals);
+
 
 const GimpPlugInInfo PLUG_IN_INFO = {NULL, NULL, query, run};
 
@@ -82,7 +240,7 @@ void query()
 		LOAD_PROC,
 		"blurb",
 		"help",
-		"author",
+		"Adam Hlavatovic",
 		"copyleft",
 		"date",
 		"menu label",
@@ -98,118 +256,124 @@ void query()
 
 void run(gchar const * name, gint nparams, GimpParam const * param,
 	gint * nreturn_vals, GimpParam ** return_vals)
-{
+{	
 	static GimpParam values[2];
-	int channels = 1;
-
 	*nreturn_vals = 1;
 	*return_vals = values;
 	values[0].type = GIMP_PDB_STATUS;
 	values[0].data.d_status = GIMP_PDB_EXECUTION_ERROR;
 
-// read image data
-	char const * filename = param[1].data.d_string;
+	if (strcmp(name, LOAD_PROC))
+		return;  // unknown procedure
 
-	ifstream fin(filename, ifstream::in);
-	if (!fin.is_open())
-	{
-		cout << "Could not open '" << filename << "' image file!\n";
-		return;
-	}
+	GimpPDBStatusType status = GIMP_PDB_SUCCESS;
 
-	// bhdr
-	bitmap_header bhead;
-	fin.seekg(0x14);
-	fin.read((char *)&bhead, 20);
+	try {
+		gint32 image = gimp_image(param[1].data.d_string);
+		if (image == -1)
+			throw logic_error("could not create gimp image");
 
-	tole2(bhead.w, bhead.h, bhead.x, bhead.y, bhead.transparent_color,
-		bhead.page_width, bhead.page_height);
-	
-	// body
-	uint32_t body_size = 0;
-	fin.seekg(0x10e2);
-	fin.read((char *)&body_size, 4);
-	tole4(body_size);
+		*nreturn_vals = 2;
+		values[1].type = GIMP_PDB_IMAGE;
+		values[1].data.d_image = image;
 
-	uint8_t * body = new uint8_t[body_size];
-	fin.read((char *)body, body_size);
+		values[0].data.d_status = status;
+	} 
+	catch (logic_error const & e) {
+		error_string = e.what();
+		status = GIMP_PDB_EXECUTION_ERROR;
+		*nreturn_vals = 2;
+		values[1].type = GIMP_PDB_STRING;
+		values[1].data.d_string = const_cast<gchar *>(error_string.c_str());
+	};
 
-	if (bhead.compression)
-	{
-		cout << "body_size:" << body_size << ", picture_size:" 
-			<< 640*480 << "\n";
+	values[0].data.d_status = status;
+}
 
-		uint32_t bitmap_size = bhead.w * bhead.h * channels;
-		uint8_t * unpacked = new uint8_t[bitmap_size];
-		if (!unpack_byte_run_1(body, body + body_size, unpacked, 
-			bitmap_size))
-		{
-			cout << "Can't unpack image data.\n";
-			return;
-		}
+gint32 gimp_image(string const & filename)
+{
+	pbm_image pbm;
+	pbm.load(filename);
+	return create_gimp_image(filename, pbm);
+}
 
-		delete [] body;
-		body = unpacked;
-	}
-
-	// color map
-	
-	// ak tam je colormap, potom type je INDEXED inak GRAY
-	
-	uint32_t cmap_size = 0;
-	fin.seekg(0x2c);
-	fin.read((char *)&cmap_size, 4);
-	tole4(cmap_size);
-
-	cout << "cmap size:" << cmap_size << "\n";
-	
-	uint8_t * cmap = new uint8_t[cmap_size];
-	fin.read((char *)cmap, cmap_size);
-
-	fin.close();
-
-// gimp magic
-
+gint32 create_gimp_image(string const & name, pbm_image const & pbm)
+{
 	// new image and layer
 	GimpImageBaseType base_type = GIMP_INDEXED;
-	gint32 image = gimp_image_new(bhead.w, bhead.h, base_type);
+	gint32 image = gimp_image_new(pbm.w(), pbm.h(), base_type);
 
 	GimpImageType image_type = GIMP_INDEXED_IMAGE;
-	gint32 layer = gimp_layer_new(image, "Background", bhead.w, bhead.h, 
+	gint32 layer = gimp_layer_new(image, "Background", pbm.w(), pbm.h(), 
 		image_type, 100, GIMP_NORMAL_MODE);
 
 	gimp_image_add_layer(image, layer, 0);
 	GimpDrawable * drawable = gimp_drawable_get(layer);
 
-	gimp_image_set_filename(image, name);
+	gimp_image_set_filename(image, name.c_str());
 
 	// fill image
 	GimpPixelRgn pixel_rgn;
 	gimp_pixel_rgn_init(&pixel_rgn, drawable, 0, 0, drawable->width,
 		drawable->height, TRUE, FALSE);
 
-	gimp_pixel_rgn_set_rect(&pixel_rgn, body, pixel_rgn.x, pixel_rgn.y, 
-		pixel_rgn.w, pixel_rgn.h);
+	gimp_pixel_rgn_set_rect(&pixel_rgn, pbm.data(), pixel_rgn.x, 
+		pixel_rgn.y, pixel_rgn.w, pixel_rgn.h);
 
 	// color map
-	gimp_image_set_colormap(image, cmap, 256);
+	color_map const & cmap = pbm.colormap();
+	gimp_image_set_colormap(image, cmap.colors, cmap.ncolors);
 
 	// apply changes
 	gimp_drawable_flush(drawable);
 	gimp_drawable_detach(drawable);
-
-	delete [] body;
-
-	*nreturn_vals = 2;
-	values[1].type = GIMP_PDB_IMAGE;
-	values[1].data.d_image = image;
-
-	GimpPDBStatusType status = GIMP_PDB_SUCCESS;
-	values[0].data.d_status = status;
 }
 
-guint32 read_image()
+bitmap_header process_bmhd(ifstream & fin, chunk_info const & info)
 {
+	fin.seekg(info.offset);
+	bitmap_header head;
+	fin.read((char *)&head, info.size);
+	tole2(head.w, head.h, head.x, head.y, head.transparent_color,
+		head.page_width, head.page_height);
+	return head;
+}
+
+color_map process_cmap(ifstream & fin, chunk_info const & info,
+	bitmap_header const & head)
+{
+	// only 3-byte rgb triplets are supported for now
+	fin.seekg(info.offset);
+	uint8_t * cmap = new uint8_t[info.size];
+	fin.read((char *)cmap, info.size);
+	return color_map(cmap, info.size/3);
+}
+
+uint8_t * process_body(ifstream & fin, chunk_info const & info, 
+	bitmap_header const & head)
+{
+	fin.seekg(info.offset);
+	uint8_t * body = new uint8_t[info.size];
+	fin.read((char *)body, info.size);
+
+	if (head.compression == cmpNone)
+		return body;
+
+	int ch = 1;  // supports only 8bit planes
+	uint32_t image_size = head.w * head.h * ch;
+	uint8_t * unpacked = new uint8_t[image_size];
+	bool is_unpacked = unpack_byte_run_1(body, body + info.size, unpacked,
+		image_size);
+	
+	delete [] body;
+
+	if (is_unpacked)
+		return unpacked;
+	else
+	{
+		delete [] unpacked;
+		return nullptr;
+	}
 }
 
 bool unpack_byte_run_1(uint8_t * first, uint8_t * last, uint8_t * result, 
