@@ -11,6 +11,13 @@ using std::map;
 #include <cstring>
 #include <libgimp/gimp.h>
 
+#include <iostream>
+using std::cout;
+#include <iomanip>
+using std::hex;
+using std::dec;
+
+
 #define LOAD_PROC "file-pbm-load"
 
 
@@ -135,8 +142,8 @@ void pbm_image::load(string const & filename) throw(logic_error)
 	if (!fin.is_open())
 		throw cant_open_file(filename);
 
-	uint8_t buf[0x0b];
-	fin.read((char *)buf, 0x0b);
+	uint8_t buf[12];
+	fin.read((char *)buf, 12);
 	
 	if (strncmp((char const *)buf, "FORM", 4))
 		throw logic_error("not an ea85 iff container");
@@ -158,6 +165,7 @@ void pbm_image::load(string const & filename) throw(logic_error)
 	_header = process_bmhd(fin, it->second);
 
 	// not all features are not supported
+	cout << "planes:" << int(_header.nplanes) << "\n";
 	if (_header.nplanes != 8)
 		throw logic_error("only 8bit planes images are supported");
 
@@ -180,26 +188,37 @@ void list_chunks(ifstream & fin, uint32_t form_size,
 	map<string, chunk_info> & chunks)
 {
 	uint32_t offset = fin.tellg();
-	uint32_t end_offset = offset + form_size;
+	uint32_t end_offset = offset + form_size - 4;
+	
+	cout << hex << "offset:" << offset << "\n"
+		<< "end_offset:" << end_offset << dec << "\n";
 
-	while (fin && offset < end_offset)
+	while (fin && (offset < end_offset))
 	{
 		chunk_info info;
-		info.offset = offset;
+		info.offset = offset + 8;
 
-		chunk_header header = read_chunk_header(fin, offset);
-		info.size = header.size;
+		chunk_header head = read_chunk_header(fin, offset);
+		info.size = head.size;
+
+		if (head.size > form_size)
+			cout << "fatal error: size field corrupted\n";
 		
 		char magic[5];
 		char * t = magic;
-		char * s = header.magic;
-		while (!isspace(*s))
-			*t++ = *s;
+		char * s = head.magic;
+		while (isalnum(*s) && t != magic+4)
+			*t++ = *s++;
 		*t = '\0';
 
 		chunks.insert(make_pair(string(magic), info));
 
-		offset += header.size;
+		cout << "chunk {magic:'" << magic 
+			<< hex << "', offset:" << info.offset
+			<< dec << ", size:" << info.size << "} append\n";
+
+		int padding = info.size % 2;
+		offset = info.offset + info.size + padding;
 	}
 }
 
@@ -327,6 +346,8 @@ gint32 create_gimp_image(string const & name, pbm_image const & pbm)
 	// apply changes
 	gimp_drawable_flush(drawable);
 	gimp_drawable_detach(drawable);
+
+	return image;
 }
 
 bitmap_header process_bmhd(ifstream & fin, chunk_info const & info)
